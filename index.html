@@ -910,7 +910,7 @@ function openHabitModal(){
 
 /* ---------- add food modal ---------- */
 let pendingMeal='breakfast';
-let pickOpenState={foods:true, recipes:false, packaged:false};
+let pickOpenState={foods:false, recipes:false, packaged:false};
 
 function sortBlended(items){
   // items: [{id, name, ...}] -> logged (by usageScore desc) first, then never-logged alphabetical
@@ -922,6 +922,7 @@ function sortBlended(items){
 
 function openAddFood(mealKey){
   pendingMeal = mealKey || 'breakfast';
+  pickOpenState={foods:false, recipes:false, packaged:false};
   // build a clean header: "Breakfast", "Lunch", "Dinner", or "Breakfast snack" etc.
   let mealCtx;
   if(pendingMeal.endsWith('_snack')){
