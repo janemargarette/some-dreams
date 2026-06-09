@@ -121,6 +121,22 @@
   .log-entry .time { font-size: 11px; color: var(--ink-faint); margin-left: 8px; }
   .meal-add { font-size: 12px; color: var(--blue); padding: 7px 0 2px; cursor: pointer; display: inline-block; }
 
+  /* add-food collapsible sections */
+  .pick-section { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; overflow: hidden; }
+  .pick-bar { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; cursor: pointer; }
+  .pick-bar .ttl { font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.04em; }
+  .pick-bar .cnt { font-size: 11px; color: var(--ink-faint); }
+  .pick-bar .arrow { transition: transform 0.2s; color: var(--ink-faint); font-size: 12px; }
+  .pick-section.open .arrow { transform: rotate(90deg); }
+  .pick-body { display: none; border-top: 1px dashed var(--line); padding: 2px 14px 8px; max-height: 300px; overflow-y: auto; }
+  .pick-section.open .pick-body { display: block; }
+  .pick-item { display: flex; justify-content: space-between; align-items: center; padding: 9px 0; border-bottom: 1px dashed var(--line); cursor: pointer; }
+  .pick-item:last-child { border-bottom: none; }
+  .pick-item .nm { font-size: 14px; }
+  .pick-item .mc { font-size: 11px; color: var(--ink-faint); }
+  .pick-item.fav .nm::before { content: '\2605  '; color: var(--amber); font-size: 11px; }
+  .pick-divider { font-size: 10px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 0 2px; }
+
   .btn {
     display: block; width: 100%; padding: 13px; border-radius: 10px;
     background: var(--accent); color: var(--bg); font-weight: bold;
@@ -244,7 +260,7 @@
   .field-row .field { flex: 1; }
   .modal-close { position: absolute; }
   .search-input { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); margin-bottom: 10px; }
-  .food-pick { display: flex; justify-content: space-between; align-items: center; padding: 11px 4px; border-bottom: 1px dashed var(--line); }
+  .food-pick { display: flex; justify-content: space-between; align-items: center; padding: 11px 4px; border-bottom: 1px dashed var(--line); cursor: pointer; }
   .food-pick .nm { font-size: 14px; }
   .food-pick .mc { font-size: 11px; color: var(--ink-faint); }
   .food-pick.add-new { color: var(--blue); font-weight: bold; }
@@ -425,6 +441,7 @@ const DEFAULT = {
   suppTemplate: ['Vitamin D', 'Omega-3', 'Magnesium'],
   habitTemplate: [],   // [{name, type:'daily'|'interval', intervalDays, lastDone}]
   weights: [],    // [{date, lbs}]
+  usage: {},      // refId -> {count, last} for blended frequent+recent ranking
 };
 
 let DB;
@@ -542,6 +559,25 @@ const MEALS=[
 /* ---------- nutrition calc ---------- */
 function foodById(id){ return DB.foods.find(f=>f.id===id); }
 function recipeById(id){ return DB.recipes.find(r=>r.id===id); }
+
+// record that an item (food or recipe) was logged, for frequent+recent ranking
+function recordUsage(refId){
+  if(!DB.usage) DB.usage={};
+  const u=DB.usage[refId]||{count:0,last:null};
+  u.count++; u.last=todayStr();
+  DB.usage[refId]=u;
+}
+// blended score: frequency plus a recency boost that decays over ~30 days.
+// higher = floats higher. returns 0 for never-logged.
+function usageScore(refId){
+  const u=DB.usage && DB.usage[refId]; if(!u) return 0;
+  let recency=0;
+  if(u.last){
+    const days=Math.max(0,Math.round((new Date(todayStr()+'T00:00:00')-new Date(u.last+'T00:00:00'))/(1000*60*60*24)));
+    recency=Math.max(0, 30-days); // 30 (today) down to 0 (>=30 days ago)
+  }
+  return u.count*2 + recency; // frequency weighted, plus recency boost
+}
 
 function entryNutrition(e) {
   // e: {type:'food'|'recipe', refId, amount, unitLabel, servings} OR custom {type:'custom', kcal, prot, name}
@@ -874,45 +910,87 @@ function openHabitModal(){
 
 /* ---------- add food modal ---------- */
 let pendingMeal='breakfast';
+let pickOpenState={foods:true, recipes:false, packaged:false};
+
+function sortBlended(items){
+  // items: [{id, name, ...}] -> logged (by usageScore desc) first, then never-logged alphabetical
+  const scored=items.map(it=>({it, score:usageScore(it.id)}));
+  const used=scored.filter(s=>s.score>0).sort((a,b)=> b.score-a.score || a.it.name.localeCompare(b.it.name));
+  const unused=scored.filter(s=>s.score===0).sort((a,b)=> a.it.name.localeCompare(b.it.name));
+  return { used:used.map(s=>s.it), unused:unused.map(s=>s.it) };
+}
+
 function openAddFood(mealKey){
   pendingMeal = mealKey || 'breakfast';
-  const mealLabel = (MEALS.find(m=>m.key===pendingMeal)||{}).label || 'Breakfast';
-  const mealCtx = pendingMeal.includes('snack') ? mealLabel+' snack' : mealLabel;
+  // build a clean header: "Breakfast", "Lunch", "Dinner", or "Breakfast snack" etc.
+  let mealCtx;
+  if(pendingMeal.endsWith('_snack')){
+    const parent=pendingMeal.replace('_snack','');
+    mealCtx=parent.charAt(0).toUpperCase()+parent.slice(1)+' snack';
+  } else {
+    mealCtx=pendingMeal.charAt(0).toUpperCase()+pendingMeal.slice(1);
+  }
   openModal(`<h2>Add to ${esc(mealCtx)}</h2>
     <input class="search-input" id="foodSearch" placeholder="Search foods &amp; recipes...">
-    <div id="foodPickList"></div>`);
+    <div id="foodPickList"></div>
+    <div style="margin-top:10px;">
+      <div class="food-pick add-new" data-newrecipe="1">+ Create new recipe</div>
+      <div class="food-pick add-new" data-newfood="1">+ Create new food</div>
+      <div class="food-pick add-new" data-newpackaged="1">+ Create new packaged food</div>
+    </div>`);
   const inp=document.getElementById('foodSearch');
   inp.focus();
-  const sectionHead=(t)=>`<div style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--ink-soft);margin:14px 0 4px;font-weight:bold;">${t}</div>`;
+
+  const itemRowFood=(f)=>`<div class="pick-item${usageScore(f.id)>0?' fav':''}" data-pickfood="${f.id}"><span class="nm">${esc(f.name)}</span><span class="mc">${f.kcalPer100g}/100g</span></div>`;
+  const itemRowRec=(r)=>`<div class="pick-item${usageScore(r.id)>0?' fav':''}" data-pickrecipe="${r.id}"><span class="nm">${esc(r.name)}</span><span class="mc">${r.kcalPerServing}/srv</span></div>`;
+
+  const section=(key,title,used,unused,rowFn)=>{
+    const total=used.length+unused.length;
+    let body='';
+    if(used.length){ used.forEach(x=>body+=rowFn(x)); if(unused.length) body+=`<div class="pick-divider">All (A&ndash;Z)</div>`; }
+    unused.forEach(x=>body+=rowFn(x));
+    if(!total) body=`<div class="empty" style="padding:8px 0;font-size:12px;">None yet.</div>`;
+    return `<div class="pick-section${pickOpenState[key]?' open':''}" data-section="${key}">
+      <div class="pick-bar" data-toggle="${key}"><span class="ttl">${title}</span>
+        <span style="display:flex;align-items:center;gap:8px;"><span class="cnt">${total}</span><span class="arrow">&#9656;</span></span></div>
+      <div class="pick-body">${body}</div></div>`;
+  };
+
   const renderPicks=(q='')=>{
     q=q.toLowerCase();
     const recs=DB.recipes.filter(r=>r.name.toLowerCase().includes(q));
     const foods=DB.foods.filter(f=>f.name.toLowerCase().includes(q));
     const ingredients=foods.filter(f=>(f.kind||'food')!=='packaged');
     const packaged=foods.filter(f=>(f.kind||'food')==='packaged');
+    const fI=sortBlended(ingredients), fR=sortBlended(recs), fP=sortBlended(packaged);
+    // when searching, auto-open sections that have matches
+    if(q){ pickOpenState={foods:!!ingredients.length, recipes:!!recs.length, packaged:!!packaged.length}; }
     let html='';
-    if(recs.length){ html+=sectionHead('Recipes');
-      recs.forEach(r=>{ html+=`<div class="food-pick" data-pickrecipe="${r.id}"><div><span class="nm">${esc(r.name)}</span></div><span class="mc">${r.kcalPerServing}/srv</span></div>`; }); }
-    if(ingredients.length){ html+=sectionHead('Foods');
-      ingredients.forEach(f=>{ html+=`<div class="food-pick" data-pickfood="${f.id}"><div><span class="nm">${esc(f.name)}</span></div><span class="mc">${f.kcalPer100g}/100g</span></div>`; }); }
-    if(packaged.length){ html+=sectionHead('Packaged foods');
-      packaged.forEach(f=>{ html+=`<div class="food-pick" data-pickfood="${f.id}"><div><span class="nm">${esc(f.name)}</span></div><span class="mc">${f.kcalPer100g}/100g</span></div>`; }); }
-    html+=sectionHead('Add new');
-    html+=`<div class="food-pick add-new" data-newrecipe="1">+ Create new recipe</div>`;
-    html+=`<div class="food-pick add-new" data-newfood="1">+ Create new food</div>`;
-    html+=`<div class="food-pick add-new" data-newpackaged="1">+ Create new packaged food</div>`;
+    html+=section('foods','Foods',fI.used,fI.unused,itemRowFood);
+    html+=section('recipes','Recipes',fR.used,fR.unused,itemRowRec);
+    html+=section('packaged','Packaged foods',fP.used,fP.unused,itemRowFood);
     document.getElementById('foodPickList').innerHTML=html;
   };
   renderPicks();
   inp.oninput=()=>renderPicks(inp.value);
+
   document.getElementById('foodPickList').addEventListener('click',e=>{
+    const toggle=e.target.closest('[data-toggle]');
+    if(toggle){ const k=toggle.dataset.toggle; const willOpen=!pickOpenState[k];
+      // accordion: only one section open at a time
+      pickOpenState={foods:false, recipes:false, packaged:false};
+      pickOpenState[k]=willOpen;
+      document.querySelectorAll('#foodPickList .pick-section').forEach(sec=>{
+        sec.classList.toggle('open', pickOpenState[sec.dataset.section]);
+      });
+      return; }
     const pf=e.target.closest('[data-pickfood]'); const pr=e.target.closest('[data-pickrecipe]');
-    const nf=e.target.closest('[data-newfood]'); const np=e.target.closest('[data-newpackaged]'); const nr=e.target.closest('[data-newrecipe]');
     if(pf) openLogFood(pf.dataset.pickfood);
     else if(pr) openLogRecipe(pr.dataset.pickrecipe);
-    else if(nf) openNewFood();
-    else if(np) openNewPackaged();
-    else if(nr) openNewRecipe(true);
+  });
+  // create-new buttons live outside the pick list
+  document.querySelectorAll('[data-newrecipe],[data-newfood],[data-newpackaged]').forEach(b=>{
+    b.onclick=()=>{ if(b.dataset.newrecipe)openNewRecipe(true); else if(b.dataset.newfood)openNewFood(); else openNewPackaged(); };
   });
 }
 
@@ -942,6 +1020,7 @@ function openLogFood(id){
     const unitLabel=document.getElementById('lfUnit').value;
     const time=document.getElementById('lfTime').value.trim();
     getDay(viewDate).food.push({type:'food',refId:id,name:f.name,amount:amt,unitLabel,meal:pendingMeal,time});
+    recordUsage(id);
     closeModal(); render(); toast('Logged');
   };
 }
@@ -961,6 +1040,7 @@ function openLogRecipe(id){
     const s=parseFloat(document.getElementById('lrServ').value)||1;
     const time=document.getElementById('lrTime').value.trim();
     getDay(viewDate).food.push({type:'recipe',refId:id,name:r.name,servings:s,meal:pendingMeal,time});
+    recordUsage(id);
     closeModal(); render(); toast('Logged');
   };
 }
