@@ -373,6 +373,14 @@
   </div>
 
   <div class="card">
+    <h2>Steps</h2>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <input type="number" id="stepsInput" inputmode="numeric" placeholder="Steps today" style="flex:1;padding:11px;border-radius:8px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink);">
+      <span id="stepsDisplay" style="font-size:13px;color:var(--ink-faint);white-space:nowrap;"></span>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Exercise</h2>
     <div id="exerciseList"></div>
     <div class="ex-add-row">
@@ -613,6 +621,8 @@ function getDay(dateStr) {
   DB.days[dateStr].supp.forEach(s=>{ if(s.period===undefined) s.period='day'; });
   // per-meal times (one time label per meal bucket)
   if(!DB.days[dateStr].mealTimes) DB.days[dateStr].mealTimes={};
+  // step count
+  if(DB.days[dateStr].steps===undefined) DB.days[dateStr].steps='';
   return DB.days[dateStr];
 }
 
@@ -690,6 +700,12 @@ function render() {
 
   // water
   renderWater(day);
+
+  // steps
+  const stepsInput=document.getElementById('stepsInput');
+  if(document.activeElement!==stepsInput) stepsInput.value = day.steps||'';
+  const stepsNum=parseInt(day.steps)||0;
+  document.getElementById('stepsDisplay').textContent = stepsNum ? stepsNum.toLocaleString()+' steps' : '';
 
   // exercise & supplements
   renderExercise(day);
@@ -901,6 +917,14 @@ function openEditLoggedEntry(idx){
     document.getElementById('elSave').onclick=()=>{ e.amount=parseFloat(document.getElementById('elAmt').value)||0; e.unitLabel=document.getElementById('elUnit').value; closeModal(); render(); toast('Updated'); };
   }
 }
+
+document.getElementById('stepsInput').addEventListener('input',()=>{
+  const day=getDay(viewDate);
+  day.steps=document.getElementById('stepsInput').value;
+  const n=parseInt(day.steps)||0;
+  document.getElementById('stepsDisplay').textContent = n ? n.toLocaleString()+' steps' : '';
+  save();
+});
 
 document.getElementById('waterPlus').onclick=()=>{ const day=getDay(viewDate); day.water++; syncWater(day); };
 document.getElementById('waterMinus').onclick=()=>{ const day=getDay(viewDate); day.water=Math.max(0,day.water-1); syncWater(day); };
@@ -1444,7 +1468,7 @@ function renderHistory(){
     const ex=day.exercise.length;
     const wEntry=DB.weights.find(w=>w.date===ds);
     return `<div class="hist-day" data-gotoday="${ds}"><div class="d"><strong>${fmtDate(ds)}</strong>${day.finished?' <span style="color:var(--green);">&check;</span>':''}</div>
-      <div class="s">${cal} cal &middot; ${Math.round(prot)}g protein &middot; ${day.water} water${ex?' &middot; '+ex+' exercise':''}${wEntry?' &middot; '+wEntry.lbs+' lbs':''}</div></div>`;
+      <div class="s">${cal} cal &middot; ${Math.round(prot)}g protein &middot; ${day.water} water${(parseInt(day.steps)||0)?' &middot; '+(parseInt(day.steps)).toLocaleString()+' steps':''}${ex?' &middot; '+ex+' exercise':''}${wEntry?' &middot; '+wEntry.lbs+' lbs':''}</div></div>`;
   }).join('');
   el.querySelectorAll('[data-gotoday]').forEach(d=>d.onclick=()=>{ viewDate=d.dataset.gotoday; switchScreen('home'); render(); });
 }
