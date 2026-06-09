@@ -9,6 +9,40 @@
 <meta name="apple-mobile-web-app-title" content="Some Dreams">
 <title>Some Dreams</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%231a1a1a'/><text y='68' x='50' font-size='60' text-anchor='middle' fill='%23e8e4d8' font-family='monospace'>S</text></svg>">
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import { getFirestore, doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBVuubFvDMtiDmKqgEyZ1P4YmhRFjN52KY",
+    authDomain: "some-dreams.firebaseapp.com",
+    projectId: "some-dreams",
+    storageBucket: "some-dreams.firebasestorage.app",
+    messagingSenderId: "634033080029",
+    appId: "1:634033080029:web:f817da2434ed30d3153d34"
+  };
+
+  const fbApp = initializeApp(firebaseConfig);
+  const auth = getAuth(fbApp);
+  const db = getFirestore(fbApp);
+  const provider = new GoogleAuthProvider();
+
+  // expose a small bridge for the main (non-module) script
+  window.SD_FB = {
+    signIn: () => signInWithPopup(auth, provider),
+    signOut: () => signOut(auth),
+    onAuth: (cb) => onAuthStateChanged(auth, cb),
+    loadCloud: async (uid) => {
+      const snap = await getDoc(doc(db, "users", uid));
+      return snap.exists() ? snap.data().payload : null;
+    },
+    saveCloud: async (uid, payload) => {
+      await setDoc(doc(db, "users", uid), { payload, updatedAt: Date.now() });
+    },
+  };
+  window.dispatchEvent(new Event('sd-fb-ready'));
+</script>
 <style>
   :root {
     --bg: #f4f1e8;
@@ -120,6 +154,8 @@
   .meal-entries { }
   .log-entry .time { font-size: 11px; color: var(--ink-faint); margin-left: 8px; }
   .meal-add { font-size: 12px; color: var(--blue); padding: 7px 0 2px; cursor: pointer; display: inline-block; }
+  .meal-time { font-size: 11px; color: var(--ink-faint); font-weight: normal; letter-spacing: 0; text-transform: none; cursor: pointer; }
+  .meal-time.add { color: var(--blue); }
 
   /* add-food collapsible sections */
   .pick-section { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; overflow: hidden; }
@@ -301,6 +337,7 @@
 <div class="app-header">
   <h1>Some Dreams</h1>
   <span class="date" id="headerDate"></span>
+  <span id="syncDot" style="font-size:14px;margin-left:8px;color:var(--green);" title="Synced">✓</span>
 </div>
 <div class="datebar">
   <button id="prevDay">&lt;</button>
@@ -405,10 +442,15 @@
       <button class="btn ghost sm" id="importBtn">Import data</button>
     </div>
     <input type="file" id="importFile" accept=".json" style="display:none;">
-    <div class="hint">Your data lives only in this browser. Export regularly, and always export before installing an updated version of the app. Import restores from a backup file.</div>
+    <div class="hint">Your data is synced to the cloud under your Google account, so it's safe across updates and devices. Export still makes a downloadable backup file; import restores from one.</div>
   </div>
   <div class="card">
-    <div class="hint" style="margin-top:0;">Some Dreams &middot; v1 &middot; offline personal tracker. For recipe PDFs, send them to Claude in chat to get per-serving numbers, then add the recipe here once.</div>
+    <h2>Account</h2>
+    <div class="settings-row"><span id="acctEmail" style="font-size:13px;color:var(--ink-soft);">Signed in</span></div>
+    <button class="btn ghost sm" id="signOutBtn" style="margin-top:10px;">Sign out</button>
+  </div>
+  <div class="card">
+    <div class="hint" style="margin-top:0;">Some Dreams &middot; v1 &middot; synced personal tracker. For recipe PDFs, send them to Claude in chat to get per-serving numbers, then add the recipe here once.</div>
   </div>
 </div>
 
@@ -426,6 +468,13 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<div id="signinOverlay" style="position:fixed;inset:0;background:var(--bg);z-index:500;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center;">
+  <h1 style="font-size:28px;margin-bottom:8px;">Some Dreams</h1>
+  <p style="font-size:14px;color:var(--ink-soft);margin-bottom:24px;max-width:280px;">Sign in to load your data and keep it synced across devices.</p>
+  <button class="btn" id="googleSignInBtn" style="width:auto;padding:13px 28px;">Sign in with Google</button>
+  <p id="signinStatus" style="font-size:12px;color:var(--ink-faint);margin-top:16px;min-height:16px;"></p>
+</div>
 
 <script>
 "use strict";
@@ -466,7 +515,26 @@ function mergeSeedFoods(db){
   const have=new Set((db.foods||[]).map(f=>f.name.toLowerCase()));
   fresh.forEach(f=>{ if(!have.has(f.name.toLowerCase())){ db.foods.push(f); } });
 }
-function save(db) { try { localStorage.setItem(KEY, JSON.stringify(db || DB)); } catch(e) { toast('Could not save - storage may be full'); } }
+function save(db) {
+  try { localStorage.setItem(KEY, JSON.stringify(db || DB)); } catch(e) { toast('Could not save locally'); }
+  scheduleCloudSave();
+}
+
+let cloudSaveTimer=null, currentUid=null;
+function scheduleCloudSave(){
+  if(!currentUid || !window.SD_FB) return;
+  clearTimeout(cloudSaveTimer);
+  cloudSaveTimer=setTimeout(async ()=>{
+    try { setSyncStatus('saving'); await window.SD_FB.saveCloud(currentUid, DB); setSyncStatus('saved'); }
+    catch(e){ setSyncStatus('error'); }
+  }, 800);
+}
+function setSyncStatus(state){
+  const el=document.getElementById('syncDot'); if(!el)return;
+  if(state==='saving'){ el.textContent='⟳'; el.title='Saving...'; el.style.color='var(--ink-faint)'; }
+  else if(state==='saved'){ el.textContent='✓'; el.title='Synced'; el.style.color='var(--green)'; }
+  else { el.textContent='!'; el.title='Sync error - changes saved locally'; el.style.color='var(--red)'; }
+}
 
 /* ---------- starter foods ----------
    Each food: { id, name, kcalPer100g, protPer100g, cookedRaw:bool, units:[{label, grams}] }
@@ -539,10 +607,12 @@ function getDay(dateStr) {
   // migrate older days: ensure exercise entries have a note field and a finished flag
   DB.days[dateStr].exercise.forEach(e=>{ if(e.note===undefined) e.note=''; });
   if(DB.days[dateStr].finished===undefined) DB.days[dateStr].finished=false;
-  // migrate food entries to have a meal bucket (old flat entries -> breakfast) and a time field
-  DB.days[dateStr].food.forEach(e=>{ if(e.meal===undefined) e.meal='breakfast'; if(e.time===undefined) e.time=''; });
+  // migrate food entries to have a meal bucket (old flat entries -> breakfast)
+  DB.days[dateStr].food.forEach(e=>{ if(e.meal===undefined) e.meal='breakfast'; });
   // migrate supplements to have a period (day/night), default day
   DB.days[dateStr].supp.forEach(s=>{ if(s.period===undefined) s.period='day'; });
+  // per-meal times (one time label per meal bucket)
+  if(!DB.days[dateStr].mealTimes) DB.days[dateStr].mealTimes={};
   return DB.days[dateStr];
 }
 
@@ -651,13 +721,15 @@ function renderMeals(day){
   const wrap=document.getElementById('mealSections');
   let html='';
   MEALS.forEach(m=>{
-    // entries for this meal, keeping their real index in day.food
     const entries=[];
     day.food.forEach((e,idx)=>{ if((e.meal||'breakfast')===m.key) entries.push({e,idx}); });
     let mc=0; entries.forEach(({e})=>{ mc+=entryNutrition(e).kcal; });
+    const t=(day.mealTimes&&day.mealTimes[m.key])||'';
+    const timeLabel = t ? `<span class="meal-time" data-mealtime="${m.key}">${esc(t)}</span>`
+                        : `<span class="meal-time add" data-mealtime="${m.key}">+ time</span>`;
     html+=`<div class="meal">
       <div class="meal-head">
-        <span class="meal-title${m.snack?' snack':''}">${m.label}</span>
+        <span class="meal-title${m.snack?' snack':''}">${m.label} ${timeLabel}</span>
         <span class="meal-subtotal">${mc?mc+' cal':''}</span>
       </div>
       <div class="meal-entries">`;
@@ -667,8 +739,7 @@ function renderMeals(day){
       let sub='';
       if(e.type==='food'){ sub=e.amount+' '+e.unitLabel; }
       else if(e.type==='recipe'){ sub=e.servings+' serving'+(e.servings!=1?'s':''); }
-      const timeStr=e.time?`<span class="time">${esc(e.time)}</span>`:'';
-      html+=`<div class="log-entry"><div><div class="name">${esc(e.name)}${timeStr}</div><div class="sub">${sub} &middot; ${n.prot}g protein</div></div>
+      html+=`<div class="log-entry" data-editfood="${idx}" style="cursor:pointer;"><div><div class="name">${esc(e.name)}</div><div class="sub">${sub} &middot; ${n.prot}g protein</div></div>
         <div style="display:flex;align-items:center;"><span class="cals">${n.kcal}</span><span class="del" data-delfood="${idx}">&times;</span></div></div>`;
     });
     html+=`</div><span class="meal-add" data-addmeal="${m.key}">+ Add to ${m.snack?'snack':m.label.toLowerCase()}</span></div>`;
@@ -774,9 +845,62 @@ document.getElementById('finishDayBtn').onclick=()=>{
 document.getElementById('mealSections').addEventListener('click',e=>{
   const del=e.target.closest('[data-delfood]');
   const add=e.target.closest('[data-addmeal]');
-  if(del){ getDay(viewDate).food.splice(+del.dataset.delfood,1); render(); }
-  if(add){ openAddFood(add.dataset.addmeal); }
+  const mt=e.target.closest('[data-mealtime]');
+  const edit=e.target.closest('[data-editfood]');
+  if(del){ getDay(viewDate).food.splice(+del.dataset.delfood,1); render(); return; }
+  if(mt){ openMealTime(mt.dataset.mealtime); return; }
+  if(add){ openAddFood(add.dataset.addmeal); return; }
+  if(edit){ openEditLoggedEntry(+edit.dataset.editfood); }
 });
+
+function openMealTime(mealKey){
+  const day=getDay(viewDate);
+  const cur=(day.mealTimes&&day.mealTimes[mealKey])||'';
+  const label=mealKey.endsWith('_snack') ? mealKey.replace('_snack','').replace(/^./,c=>c.toUpperCase())+' snack' : mealKey.replace(/^./,c=>c.toUpperCase());
+  openModal(`<h2>${esc(label)} time</h2>
+    <div class="field"><label>Time</label><input id="mtVal" value="${esc(cur)}" placeholder="e.g. 8:30 AM"></div>
+    <div class="btn-row"><button class="btn ghost" id="mtClear" style="margin:0;">Clear</button><button class="btn" id="mtSave" style="margin:0;">Save</button></div>`);
+  document.getElementById('mtVal').focus();
+  document.getElementById('mtSave').onclick=()=>{
+    if(!day.mealTimes)day.mealTimes={};
+    day.mealTimes[mealKey]=document.getElementById('mtVal').value.trim();
+    closeModal(); render();
+  };
+  document.getElementById('mtClear').onclick=()=>{ if(day.mealTimes)delete day.mealTimes[mealKey]; closeModal(); render(); };
+}
+
+function openEditLoggedEntry(idx){
+  const day=getDay(viewDate);
+  const e=day.food[idx]; if(!e)return;
+  if(e.type==='recipe'){
+    const r=recipeById(e.refId);
+    openModal(`<h2>${esc(e.name)}</h2>
+      <div class="field"><label>Servings</label><input type="number" id="elServ" value="${e.servings}" step="0.25" inputmode="decimal"></div>
+      <div class="card" style="margin:0 0 12px;"><div style="display:flex;justify-content:space-between;"><span id="elPrev"></span><span id="elPrevP" style="color:var(--ink-soft);"></span></div></div>
+      <button class="btn" id="elSave">Save</button>`);
+    const upd=()=>{ const s=parseFloat(document.getElementById('elServ').value)||0;
+      document.getElementById('elPrev').textContent=Math.round((r?r.kcalPerServing:0)*s)+' cal';
+      document.getElementById('elPrevP').textContent=Math.round((r?r.protPerServing:0)*s)+'g protein'; };
+    document.getElementById('elServ').oninput=upd; upd();
+    document.getElementById('elSave').onclick=()=>{ e.servings=parseFloat(document.getElementById('elServ').value)||1; closeModal(); render(); toast('Updated'); };
+  } else {
+    const f=foodById(e.refId);
+    const unitOpts=(f?f.units:[{label:e.unitLabel,grams:1}]).map(u=>`<option value="${u.label}"${u.label===e.unitLabel?' selected':''}>${u.label}</option>`).join('');
+    openModal(`<h2>${esc(e.name)}</h2>
+      <div class="field-row">
+        <div class="field"><label>Amount</label><input type="number" id="elAmt" value="${e.amount}" step="0.1" inputmode="decimal"></div>
+        <div class="field"><label>Unit</label><select id="elUnit">${unitOpts}</select></div>
+      </div>
+      <div class="card" style="margin:0 0 12px;"><div style="display:flex;justify-content:space-between;"><span id="elPrev"></span><span id="elPrevP" style="color:var(--ink-soft);"></span></div></div>
+      <button class="btn" id="elSave">Save</button>`);
+    const upd=()=>{ const amt=parseFloat(document.getElementById('elAmt').value)||0; const unitLabel=document.getElementById('elUnit').value;
+      const n=entryNutrition({type:'food',refId:e.refId,amount:amt,unitLabel});
+      document.getElementById('elPrev').textContent=n.kcal+' cal';
+      document.getElementById('elPrevP').textContent=n.prot+'g protein'; };
+    document.getElementById('elAmt').oninput=upd; document.getElementById('elUnit').onchange=upd; upd();
+    document.getElementById('elSave').onclick=()=>{ e.amount=parseFloat(document.getElementById('elAmt').value)||0; e.unitLabel=document.getElementById('elUnit').value; closeModal(); render(); toast('Updated'); };
+  }
+}
 
 document.getElementById('waterPlus').onclick=()=>{ const day=getDay(viewDate); day.water++; syncWater(day); };
 document.getElementById('waterMinus').onclick=()=>{ const day=getDay(viewDate); day.water=Math.max(0,day.water-1); syncWater(day); };
@@ -1003,7 +1127,6 @@ function openLogFood(id){
       <div class="field"><label>Amount</label><input type="number" id="lfAmt" value="1" step="0.1" inputmode="decimal"></div>
       <div class="field"><label>Unit</label><select id="lfUnit">${unitOpts}</select></div>
     </div>
-    <div class="field"><label>Time (optional)</label><input id="lfTime" placeholder="e.g. 8:30 AM"></div>
     ${f.cookedRaw?'<div class="hint" style="margin-top:0;margin-bottom:12px;">Values are for cooked weight.</div>':''}
     <div class="card" style="margin:0 0 12px;"><div style="display:flex;justify-content:space-between;"><span id="lfPrev">--</span><span id="lfPrevP" style="color:var(--ink-soft);"></span></div></div>
     <button class="btn" id="lfSave">Log it</button>`);
@@ -1019,8 +1142,7 @@ function openLogFood(id){
   document.getElementById('lfSave').onclick=()=>{
     const amt=parseFloat(document.getElementById('lfAmt').value)||0;
     const unitLabel=document.getElementById('lfUnit').value;
-    const time=document.getElementById('lfTime').value.trim();
-    getDay(viewDate).food.push({type:'food',refId:id,name:f.name,amount:amt,unitLabel,meal:pendingMeal,time});
+    getDay(viewDate).food.push({type:'food',refId:id,name:f.name,amount:amt,unitLabel,meal:pendingMeal});
     recordUsage(id);
     closeModal(); render(); toast('Logged');
   };
@@ -1030,7 +1152,6 @@ function openLogRecipe(id){
   const r=recipeById(id);
   openModal(`<h2>${esc(r.name)}</h2>
     <div class="field"><label>Servings</label><input type="number" id="lrServ" value="1" step="0.25" inputmode="decimal"></div>
-    <div class="field"><label>Time (optional)</label><input id="lrTime" placeholder="e.g. 7:00 PM"></div>
     <div class="card" style="margin:0 0 12px;"><div style="display:flex;justify-content:space-between;"><span id="lrPrev">${r.kcalPerServing} cal</span><span style="color:var(--ink-soft);" id="lrPrevP">${r.protPerServing}g protein</span></div></div>
     <button class="btn" id="lrSave">Log it</button>`);
   const upd=()=>{ const s=parseFloat(document.getElementById('lrServ').value)||0;
@@ -1039,8 +1160,7 @@ function openLogRecipe(id){
   document.getElementById('lrServ').oninput=upd;
   document.getElementById('lrSave').onclick=()=>{
     const s=parseFloat(document.getElementById('lrServ').value)||1;
-    const time=document.getElementById('lrTime').value.trim();
-    getDay(viewDate).food.push({type:'recipe',refId:id,name:r.name,servings:s,meal:pendingMeal,time});
+    getDay(viewDate).food.push({type:'recipe',refId:id,name:r.name,servings:s,meal:pendingMeal});
     recordUsage(id);
     closeModal(); render(); toast('Logged');
   };
@@ -1413,6 +1533,12 @@ function openEditFood(id){
   };
 }
 
+document.getElementById('signOutBtn').onclick=async ()=>{
+  if(window.SD_FB && confirm('Sign out? Your data is saved in the cloud and will load again when you sign back in.')){
+    try { await window.SD_FB.signOut(); location.reload(); } catch(e){ toast('Could not sign out'); }
+  }
+};
+
 document.getElementById('exportBtn').onclick=()=>{
   const blob=new Blob([JSON.stringify(DB,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
@@ -1455,9 +1581,72 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>switchScreen(b
 
 window.addEventListener('resize',()=>{ if(document.getElementById('screen-weight').classList.contains('active'))drawWeightChart(); });
 
-/* ---------- init ---------- */
-DB = load();
-render();
+/* ---------- init with Firebase auth + cloud sync ---------- */
+
+// Build DB from a cloud payload (or seed fresh), running the same migrations as local load.
+function buildDBFrom(payload){
+  if(!payload){ return seed(structuredClone(DEFAULT)); }
+  const db = Object.assign(structuredClone(DEFAULT), payload);
+  mergeSeedFoods(db);
+  return db;
+}
+
+function startApp(){
+  render();
+  document.getElementById('signinOverlay').style.display='none';
+}
+
+function wireFirebase(){
+  const overlay=document.getElementById('signinOverlay');
+  const statusEl=document.getElementById('signinStatus');
+  const btn=document.getElementById('googleSignInBtn');
+
+  btn.onclick=async ()=>{
+    statusEl.textContent='Opening Google sign-in...';
+    try { await window.SD_FB.signIn(); }
+    catch(e){ statusEl.textContent='Sign-in was cancelled or blocked. Try again.'; }
+  };
+
+  window.SD_FB.onAuth(async (user)=>{
+    if(user){
+      currentUid=user.uid;
+      statusEl.textContent='Loading your data...';
+      let payload=null;
+      try { payload=await window.SD_FB.loadCloud(user.uid); }
+      catch(e){ statusEl.textContent='Could not reach the cloud. Using local data.'; }
+      if(payload){
+        DB=buildDBFrom(payload);
+      } else {
+        // first sign-in on this account: start from local cache if present, else seed
+        try {
+          const raw=localStorage.getItem(KEY);
+          DB = raw ? buildDBFrom(JSON.parse(raw)) : buildDBFrom(null);
+        } catch(e){ DB=buildDBFrom(null); }
+        // push initial copy to cloud
+        try { await window.SD_FB.saveCloud(user.uid, DB); } catch(e){}
+      }
+      save(DB);
+      startApp();
+    } else {
+      currentUid=null;
+      overlay.style.display='flex';
+    }
+  });
+}
+
+// Wait for the Firebase module bridge to be ready, then wire up.
+if(window.SD_FB){ wireFirebase(); }
+else { window.addEventListener('sd-fb-ready', wireFirebase, {once:true}); }
+
+// Fallback: if Firebase fails to load entirely (offline/old cache), run local-only after a delay
+setTimeout(()=>{
+  if(!DB){
+    try { DB=load(); } catch(e){ DB=buildDBFrom(null); }
+    render();
+    document.getElementById('signinOverlay').style.display='none';
+    setSyncStatus('error');
+  }
+}, 4000);
 </script>
 </body>
 </html>
